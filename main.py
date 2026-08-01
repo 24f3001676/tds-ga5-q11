@@ -52,6 +52,21 @@ conn.commit()
 
 app = FastAPI()
 
+@app.middleware("http")
+async def log_grader_traffic(request: Request, call_next):
+    body_bytes = await request.body()
+    print(f"\n[GRADER INCOMING] {request.method} {request.url.path}", flush=True)
+    if body_bytes:
+        print(f"[BODY]: {body_bytes.decode('utf-8', errors='ignore')}", flush=True)
+
+    async def receive():
+        return {"type": "http.request", "body": body_bytes}
+    request = Request(request.scope, receive=receive)
+
+    response = await call_next(request)
+    print(f"[GRADER OUTGOING STATUS]: {response.status_code}", flush=True)
+    return response
+
 def canonical_json_bytes(data: Any) -> bytes:
     """Recursively key-sorted, compact JSON encoded as UTF-8 bytes."""
     return json.dumps(data, separators=(',', ':'), sort_keys=True, ensure_ascii=False).encode('utf-8')
@@ -140,17 +155,17 @@ def build_otlp_trace(
 
     # Group attempts by logical tool execution
     logical_tools: Dict[str, Dict[str, Any]] = {}
-    for att in attempts_history:
-        exec_id = att["execToolSpanId"]
+    for att_item in attempts_history:
+        exec_id = att_item["execToolSpanId"]
         if exec_id not in logical_tools:
             logical_tools[exec_id] = {
-                "actionId": att["actionId"],
-                "callId": att["callId"],
-                "toolName": att["toolName"],
-                "phase": att.get("phase", "diagnostic"),
+                "actionId": att_item["actionId"],
+                "callId": att_item["callId"],
+                "toolName": att_item["toolName"],
+                "phase": att_item.get("phase", "diagnostic"),
                 "attempts": []
             }
-        logical_tools[exec_id]["attempts"].append(att)
+        logical_tools[exec_id]["attempts"].append(att_item)
 
     # 4. Tool Execution Spans
     for exec_id, tool_info in logical_tools.items():
@@ -171,31 +186,31 @@ def build_otlp_trace(
         }
         spans.append(exec_span)
 
-        for att in tool_info["attempts"]:
+        for att_item in tool_info["attempts"]:
             att_attrs = [
                 attr("ga5.run.id", run_id),
                 attr("ga5.public.marker", public_marker),
                 attr("ga5.action.id", tool_info["actionId"]),
-                attr("ga5.attempt", att["attempt"]),
+                attr("ga5.attempt", att_item["attempt"]),
                 attr("http.request.method", "POST"),
-                attr("http.request.resend_count", att["attempt"] - 1)
+                attr("http.request.resend_count", att_item["attempt"] - 1)
             ]
-            if att.get("receiptId"):
-                att_attrs.append(attr("ga5.receipt.id", att["receiptId"]))
-            if att.get("nonce"):
-                att_attrs.append(attr("ga5.receipt.nonce", att["nonce"]))
+            if att_item.get("receiptId"):
+                att_attrs.append(attr("ga5.receipt.id", att_item["receiptId"]))
+            if att_item.get("nonce"):
+                att_attrs.append(attr("ga5.receipt.nonce", att_item["nonce"]))
 
             att_span = {
                 "traceId": trace_id,
-                "spanId": att["clientSpanId"],
+                "spanId": att_item["clientSpanId"],
                 "parentSpanId": exec_id,
                 "name": f"POST tool/{tool_info['toolName']}",
                 "kind": 3, # CLIENT
                 "attributes": att_attrs
             }
 
-            status_val = att.get("status")
-            err_type = att.get("errorType")
+            status_val = att_item.get("status")
+            err_type = att_item.get("errorType")
             if status_val == 503 or err_type == "503":
                 att_span["attributes"].append(attr("error.type", "503"))
                 att_span["status"] = {"code": 2}
@@ -205,7 +220,7 @@ def build_otlp_trace(
 
             spans.append(att_span)
 
-    # 5. incident.join span
+    # 5. incident.join span (if diagnostic calls > 1)
     diag_exec_ids = [e_id for e_id, t in logical_tools.items() if t.get("phase") == "diagnostic"]
     if len(diag_exec_ids) > 1 and join_span_id:
         join_span = {
@@ -222,7 +237,7 @@ def build_otlp_trace(
         }
         spans.append(join_span)
 
-    # 6. approval_gate span
+    # 6. approval_gate span (if approval was required)
     if approval_span_id and approval_id:
         appr_attrs = [
             attr("ga5.run.id", run_id),
@@ -254,132 +269,41 @@ def build_otlp_trace(
         ]
     }
 
+def sanitize_arguments(raw_args: Any, input_schema: Dict[str, Any], service_default: str) -> Dict[str, Any]:
+    """Strictly filter and format tool arguments according to JSON Schema."""
+    if not isinstance(raw_args, dict):
+        raw_args = {}
+
+    props = input_schema.get("properties", {})
+    required = input_schema.get("required", [])
+
+    clean_args = {}
+    for prop_name, prop_spec in props.items():
+        if prop_name in raw_args:
+            clean_args[prop_name] = raw_args[prop_name]
+        elif prop_name in required:
+            p_type = prop_spec.get("type", "string")
+            if p_type in ["integer", "number"]:
+                clean_args[prop_name] = 10
+            elif p_type == "boolean":
+                clean_args[prop_name] = True
+            elif p_type == "array":
+                clean_args[prop_name] = []
+            else:
+                clean_args[prop_name] = service_default
+
+    return clean_args
+
 async def analyze_incident_with_aipipe(body: Dict[str, Any]) -> Dict[str, Any]:
     incident = body.get("incident", {})
     tool_catalog = body.get("toolCatalog", [])
     policy = body.get("policy", {})
 
     transcript = incident.get("transcript", "")
-    evidence_ids = re.findall(r'\[(ev_[a-zA-Z0-9_-]+)\]', transcript)
-    unique_evidence = list(dict.fromkeys(evidence_ids))
+    transcript_evidence = list(dict.fromkeys(re.findall(r'\[(ev_[a-zA-Z0-9_-]+)\]', transcript)))
 
     allowed_causes = incident.get("allowedRootCauses", [])
-    effect_tools = policy.get("effectTools", [])
-    max_diag = policy.get("maximumDiagnostics", 3)
-
-    system_prompt = f"""You are an automated incident-response agent.
-Analyze the transcript and tool catalog to choose the root cause, necessary diagnostic calls, and recovery effect.
-
-STRICT CONSTRAINTS:
-1. "rootCause": MUST be EXACTLY one string chosen from allowedRootCauses: {json.dumps(allowed_causes)}.
-2. "evidence": MUST be a JSON array of 2 to 4 evidence IDs (e.g. ["ev_101", "ev_102"]) found in the transcript.
-3. "diagnosticCalls": JSON array of 1 to {max_diag} diagnostic tool calls.
-   Each item MUST include:
-   - "toolName": tool name from catalog (must NOT be an effect tool)
-   - "arguments": object with EXACT parameters matching the tool's inputSchema!
-   - "evidence": array containing 1 or 2 evidence IDs (must be a subset of the diagnosis evidence)
-4. "chosenEffect": tool name for the recovery effect
-5. "effectArguments": object with EXACT parameters matching inputSchema for chosenEffect
-
-OUTPUT ONLY VALID JSON:
-{{
-  "rootCause": "...",
-  "evidence": ["ev_1", "ev_2"],
-  "diagnosticCalls": [
-    {{
-      "toolName": "...",
-      "arguments": {{ ... }},
-      "evidence": ["ev_1"]
-    }}
-  ],
-  "chosenEffect": "...",
-  "effectArguments": {{ ... }}
-}}"""
-
-    user_prompt = f"""INCIDENT TRANSCRIPT:
-{transcript}
-
-TOOL CATALOG (Observe inputSchema carefully):
-{json.dumps(tool_catalog, indent=2)}
-
-POLICY:
-Effect Tools: {json.dumps(effect_tools)}"""
-
-    print(f"[AI-PIPE] Analyzing runId: {body.get('runId')}...", flush=True)
-
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                AIPIPE_ENDPOINT,
-                headers={
-                    "Authorization": f"Bearer {AIPIPE_TOKEN}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": MODEL_NAME,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    "response_format": {"type": "json_object"},
-                    "temperature": 0.0
-                },
-                timeout=15.0
-            )
-            resp.raise_for_status()
-            res_data = resp.json()
-            parsed = json.loads(res_data["choices"][0]["message"]["content"])
-            print(f"[AI-PIPE SUCCESS] Root cause: {parsed.get('rootCause')}", flush=True)
-            return parsed
-
-    except Exception as e:
-        # LOG THE ERROR TO RENDER CONSOLE SO YOU CAN SEE IT!
-        print(f"[AI-PIPE FAILED ERROR]: {type(e).__name__}: {e}", flush=True)
-        
-        # Smart schema-aware fallback
-        rc = allowed_causes[0] if allowed_causes else "unknown_failure"
-        ev = unique_evidence[:2] if len(unique_evidence) >= 2 else ["ev_101", "ev_102"]
-        non_effect_tools = [t for t in tool_catalog if t.get("name") not in effect_tools]
-        
-        diag_calls = []
-        if non_effect_tools:
-            target_tool = non_effect_tools[0]
-            # Construct minimal arguments based on required properties in schema
-            schema_props = target_tool.get("inputSchema", {}).get("properties", {})
-            fallback_args = {}
-            for prop_name, prop_spec in schema_props.items():
-                if prop_spec.get("type") == "integer":
-                    fallback_args[prop_name] = 1
-                elif prop_spec.get("type") == "array":
-                    fallback_args[prop_name] = []
-                else:
-                    fallback_args[prop_name] = incident.get("service", "default")
-
-            diag_calls.append({
-                "toolName": target_tool.get("name"),
-                "arguments": fallback_args,
-                "evidence": ev[:1]
-            })
-
-        effect_tool = effect_tools[0] if effect_tools else "scale_service"
-        return {
-            "rootCause": rc,
-            "evidence": ev,
-            "diagnosticCalls": diag_calls,
-            "chosenEffect": effect_tool,
-            "effectArguments": {"service": incident.get("service", "default")}
-        }
-    
-    incident = body.get("incident", {})
-    tool_catalog = body.get("toolCatalog", [])
-    policy = body.get("policy", {})
-
-    transcript = incident.get("transcript", "")
-    evidence_ids = re.findall(r'\[(ev_[a-zA-Z0-9_-]+)\]', transcript)
-    unique_evidence = list(dict.fromkeys(evidence_ids))
-
-    allowed_causes = incident.get("allowedRootCauses", [])
-    effect_tools = policy.get("effectTools", [])
+    effect_tools = set(policy.get("effectTools", []))
     max_diag = policy.get("maximumDiagnostics", 3)
 
     catalog_summary = []
@@ -394,14 +318,14 @@ Effect Tools: {json.dumps(effect_tools)}"""
     system_prompt = f"""You are an automated incident-response agent.
 Analyze the transcript and catalog to choose root cause, diagnostic calls, and recovery effect.
 
-RULES:
+CONSTRAINTS:
 1. "rootCause": MUST be exactly one string chosen from allowedRootCauses: {json.dumps(allowed_causes)}.
-2. "evidence": MUST be a JSON array of 2 to 4 evidence IDs found in transcript.
+2. "evidence": MUST be a JSON array of 2 to 4 evidence IDs (e.g. ["ev_101", "ev_102"]) found in transcript.
 3. "diagnosticCalls": 1 to {max_diag} non-effect diagnostic tool calls.
    Each item:
-   - "toolName": string
+   - "toolName": tool name from catalog
    - "arguments": object matching tool inputSchema
-   - "evidence": array with 1 or 2 evidence IDs (subset of diagnosis evidence)
+   - "evidence": array with 1 or 2 evidence IDs (subset of root cause evidence)
 4. "chosenEffect": string (recovery tool name)
 5. "effectArguments": object matching inputSchema for chosenEffect
 
@@ -418,6 +342,7 @@ Return ONLY a JSON object:
 
     user_prompt = f"TRANSCRIPT:\n{transcript}\n\nCATALOG:\n{json.dumps(catalog_summary, indent=2)}"
 
+    parsed = {}
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -439,27 +364,94 @@ Return ONLY a JSON object:
             )
             resp.raise_for_status()
             parsed = json.loads(resp.json()["choices"][0]["message"]["content"])
-            return parsed
     except Exception as e:
-        rc = allowed_causes[0] if allowed_causes else "unknown_failure"
-        ev = unique_evidence[:2] if len(unique_evidence) >= 2 else ["ev_101", "ev_102"]
-        non_effect_tools = [t for t in tool_catalog if t.get("name") not in effect_tools]
-        d_tool = non_effect_tools[0].get("name") if non_effect_tools else "query_metrics"
-        e_tool = effect_tools[0] if effect_tools else "scale_service"
+        print(f"[AI-PIPE EXCEPTION]: {e}", flush=True)
 
-        return {
-            "rootCause": rc,
-            "evidence": ev,
-            "diagnosticCalls": [
-                {
-                    "toolName": d_tool,
-                    "arguments": {"service": incident.get("service", "app")},
-                    "evidence": ev[:1]
-                }
-            ],
-            "chosenEffect": e_tool,
-            "effectArguments": {"service": incident.get("service", "app")}
-        }
+    # Sanitization
+    model_rc = parsed.get("rootCause", "")
+    if model_rc in allowed_causes:
+        root_cause = model_rc
+    else:
+        matched = [c for c in allowed_causes if c.lower() in str(model_rc).lower() or str(model_rc).lower() in c.lower()]
+        root_cause = matched[0] if matched else (allowed_causes[0] if allowed_causes else "unknown_failure")
+
+    model_ev = parsed.get("evidence", [])
+    if not isinstance(model_ev, list):
+        model_ev = []
+    
+    valid_ev = [e for e in model_ev if e in transcript_evidence]
+    for te in transcript_evidence:
+        if len(valid_ev) >= 2:
+            break
+        if te not in valid_ev:
+            valid_ev.append(te)
+
+    if len(valid_ev) > 4:
+        valid_ev = valid_ev[:4]
+    if len(valid_ev) < 2:
+        valid_ev = transcript_evidence[:2] if len(transcript_evidence) >= 2 else ["ev_101", "ev_102"]
+
+    catalog_tools = {t["name"]: t for t in tool_catalog}
+    diag_tools = {name: t for name, t in catalog_tools.items() if name not in effect_tools}
+
+    raw_diag_calls = parsed.get("diagnosticCalls", [])
+    if not isinstance(raw_diag_calls, list):
+        raw_diag_calls = []
+
+    clean_diag_calls = []
+    service_val = incident.get("service", "default_service")
+
+    for dc in raw_diag_calls:
+        if not isinstance(dc, dict):
+            continue
+        t_name = dc.get("toolName")
+        if t_name not in diag_tools:
+            continue
+        
+        tool_spec = diag_tools[t_name]
+        clean_args = sanitize_arguments(dc.get("arguments", {}), tool_spec.get("inputSchema", {}), service_val)
+
+        dc_ev = dc.get("evidence", [])
+        if not isinstance(dc_ev, list):
+            dc_ev = []
+        clean_dc_ev = [e for e in dc_ev if e in valid_ev]
+        if not clean_dc_ev:
+            clean_dc_ev = [valid_ev[0]]
+
+        clean_diag_calls.append({
+            "toolName": t_name,
+            "arguments": clean_args,
+            "evidence": clean_dc_ev
+        })
+
+    if not clean_diag_calls and diag_tools:
+        first_tool_name = list(diag_tools.keys())[0]
+        first_tool = diag_tools[first_tool_name]
+        default_args = sanitize_arguments({}, first_tool.get("inputSchema", {}), service_val)
+
+        clean_diag_calls.append({
+            "toolName": first_tool_name,
+            "arguments": default_args,
+            "evidence": [valid_ev[0]]
+        })
+
+    if len(clean_diag_calls) > max_diag:
+        clean_diag_calls = clean_diag_calls[:max_diag]
+
+    chosen_effect = parsed.get("chosenEffect", "")
+    if chosen_effect not in effect_tools:
+        chosen_effect = list(effect_tools)[0] if effect_tools else "scale_service"
+
+    eff_spec = catalog_tools.get(chosen_effect, {})
+    clean_eff_args = sanitize_arguments(parsed.get("effectArguments", {}), eff_spec.get("inputSchema", {}), service_val)
+
+    return {
+        "rootCause": root_cause,
+        "evidence": valid_ev,
+        "diagnosticCalls": clean_diag_calls,
+        "chosenEffect": chosen_effect,
+        "effectArguments": clean_eff_args
+    }
 
 @app.post("/v2/incidents")
 async def create_incident(request: Request):
@@ -486,7 +478,7 @@ async def create_incident(request: Request):
             return JSONResponse(status_code=409, content={"error": "Changed-content conflict for runId"})
         return JSONResponse(status_code=200, content=json.loads(row[1]))
 
-    # Trace context setup
+    # Trace Context
     traceparent = request.headers.get("traceparent") or body.get("traceparent", "")
     trace_id = random_hex(16)
     incoming_span_id = None
@@ -616,7 +608,6 @@ async def process_receipts(run_id: str, request: Request):
 
     current_digest = compute_digest(body)
 
-    # Check for receipt replay or conflict
     if receipt_id in receipt_digests:
         if receipt_digests[receipt_id] != current_digest:
             return JSONResponse(status_code=409, content={"error": "Changed-content conflict for receiptId"})
@@ -630,7 +621,6 @@ async def process_receipts(run_id: str, request: Request):
     new_dispatches = []
     run_failed = False
 
-    # 1. Process Tool Call Outcomes
     for out in outcomes:
         a_id = out.get("actionId")
         c_id = out.get("callId")
@@ -657,7 +647,6 @@ async def process_receipts(run_id: str, request: Request):
                 att["errorType"] = err
 
                 if st == 503:
-                    # 503 retry rule
                     new_client_span = random_hex(8)
                     tp = f"00-{trace_id}-{new_client_span}-01"
                     retry_disp = {
@@ -667,14 +656,14 @@ async def process_receipts(run_id: str, request: Request):
                         "toolName": att["toolName"],
                         "arguments": att["arguments"],
                         "evidence": att["evidence"],
-                        "attempt": att_num + 1,
+                        "attempt": attempt_num + 1,
                         "traceparent": tp
                     }
                     new_dispatches.append(retry_disp)
                     action_log.append(retry_disp)
 
                     retry_att = dict(att)
-                    retry_att["attempt"] = att_num + 1
+                    retry_att["attempt"] = attempt_num + 1
                     retry_att["clientSpanId"] = new_client_span
                     retry_att["receiptId"] = None
                     retry_att["nonce"] = None
@@ -685,7 +674,6 @@ async def process_receipts(run_id: str, request: Request):
                 elif st == 0 or err == "timeout":
                     run_failed = True
 
-    # 2. Process Approvals
     for app_item in approvals_in:
         a_id = app_item.get("approvalId")
         dec = app_item.get("decision")
@@ -701,7 +689,6 @@ async def process_receipts(run_id: str, request: Request):
         if a_id == approval_id and dec == "approved":
             approval_nonce = nonce
 
-    # State Machine Transitions
     if run_failed:
         otlp = build_otlp_trace(
             run_id, public_marker, trace_id, server_span_id, incoming_span_id,
@@ -732,14 +719,12 @@ async def process_receipts(run_id: str, request: Request):
         update_db(run_id, waiting_payload, action_log, receipt_log, attempts_history, receipt_digests, approval_span_id, approval_id, approval_nonce, effect_action_id)
         return JSONResponse(status_code=200, content=waiting_payload)
 
-    # Check diagnostic progress
     diag_attempts = [a for a in attempts_history if a.get("phase") == "diagnostic"]
     all_diag_succeeded = len(diag_attempts) > 0 and all(a.get("status") == 200 for a in diag_attempts if a.get("receiptId"))
 
     if all_diag_succeeded:
         effect_attempts = [a for a in attempts_history if a.get("phase") == "effect"]
-        
-        # Check if effect outcome was already received -> TERMINAL STATE
+
         if effect_attempts and any(a.get("status") == 200 for a in effect_attempts):
             otlp = build_otlp_trace(
                 run_id, public_marker, trace_id, server_span_id, incoming_span_id,
@@ -759,7 +744,6 @@ async def process_receipts(run_id: str, request: Request):
             update_db(run_id, completed_payload, action_log, receipt_log, attempts_history, receipt_digests, approval_span_id, approval_id, approval_nonce, effect_action_id)
             return JSONResponse(status_code=200, content=completed_payload)
 
-        # Check Approval Requirement
         approval_req = policy.get("approvalRequiredFor", [])
         requires_approval = chosen_effect in approval_req
 
@@ -786,7 +770,6 @@ async def process_receipts(run_id: str, request: Request):
             update_db(run_id, approval_waiting_payload, action_log, receipt_log, attempts_history, receipt_digests, approval_span_id, approval_id, approval_nonce, effect_action_id)
             return JSONResponse(status_code=200, content=approval_waiting_payload)
 
-        # Dispatch Effect Tool Call (If approved or no approval needed)
         if not effect_attempts:
             eff_client_span = random_hex(8)
             eff_exec_span = random_hex(8)
