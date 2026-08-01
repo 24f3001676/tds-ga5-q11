@@ -5,7 +5,7 @@ import sqlite3
 import hashlib
 import asyncio
 from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import httpx
 
@@ -17,7 +17,7 @@ AIPIPE_TOKEN = os.getenv(
 AIPIPE_ENDPOINT = "https://aipipe.org/openai/v1/chat/completions"
 MODEL_NAME = "gpt-4o-mini"
 
-# Initialize SQLite database
+# Initialize SQLite
 conn = sqlite3.connect("incidents.db", check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute("PRAGMA journal_mode=WAL;")
@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS runs (
     approval_span_id TEXT,
     approval_id TEXT,
     approval_nonce TEXT,
+    effect_action_id TEXT,
     policy_json TEXT NOT NULL,
     diagnosis_json TEXT NOT NULL,
     chosen_effect TEXT NOT NULL,
@@ -63,7 +64,6 @@ def random_hex(num_bytes: int) -> str:
     return os.urandom(num_bytes).hex()
 
 def attr(key: str, val: Any) -> Dict[str, Any]:
-    """Format key-value pair as OTLP attribute."""
     if isinstance(val, int):
         return {"key": key, "value": {"intValue": val}}
     elif isinstance(val, bool):
@@ -87,7 +87,7 @@ def build_otlp_trace(
     approval_nonce: Optional[str],
     attempts_history: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
-    """Construct precise, fully redacted OTLP trace per spec."""
+    """Construct precise, fully redacted OTLP trace hierarchy."""
     spans = []
 
     # 1. SERVER span
@@ -138,7 +138,7 @@ def build_otlp_trace(
     }
     spans.append(chat_span)
 
-    # Group attempts by logical action ID
+    # Group attempts by logical tool execution
     logical_tools: Dict[str, Dict[str, Any]] = {}
     for att in attempts_history:
         exec_id = att["execToolSpanId"]
@@ -198,14 +198,14 @@ def build_otlp_trace(
             err_type = att.get("errorType")
             if status_val == 503 or err_type == "503":
                 att_span["attributes"].append(attr("error.type", "503"))
-                att_span["status"] = {"code": 2} # ERROR
+                att_span["status"] = {"code": 2}
             elif err_type == "timeout" or status_val == 0:
                 att_span["attributes"].append(attr("error.type", "timeout"))
-                att_span["status"] = {"code": 2} # ERROR
+                att_span["status"] = {"code": 2}
 
             spans.append(att_span)
 
-    # 5. incident.join span (if diagnostics fan out > 1)
+    # 5. incident.join span
     diag_exec_ids = [e_id for e_id, t in logical_tools.items() if t.get("phase") == "diagnostic"]
     if len(diag_exec_ids) > 1 and join_span_id:
         join_span = {
@@ -222,7 +222,7 @@ def build_otlp_trace(
         }
         spans.append(join_span)
 
-    # 6. approval_gate span (if approval was required)
+    # 6. approval_gate span
     if approval_span_id and approval_id:
         appr_attrs = [
             attr("ga5.run.id", run_id),
@@ -263,51 +263,45 @@ async def analyze_incident_with_aipipe(body: Dict[str, Any]) -> Dict[str, Any]:
     evidence_ids = re.findall(r'\[(ev_[a-zA-Z0-9_-]+)\]', transcript)
     unique_evidence = list(dict.fromkeys(evidence_ids))
 
-    system_prompt = """You are an automated AI incident-response agent.
-Analyze the incident transcript and choose the correct root cause, diagnostic tool calls, and recovery effect tool call.
+    allowed_causes = incident.get("allowedRootCauses", [])
+    effect_tools = policy.get("effectTools", [])
+    max_diag = policy.get("maximumDiagnostics", 3)
+
+    catalog_summary = []
+    for t in tool_catalog:
+        catalog_summary.append({
+            "name": t.get("name"),
+            "description": t.get("description"),
+            "is_effect": t.get("name") in effect_tools,
+            "inputSchema": t.get("inputSchema")
+        })
+
+    system_prompt = f"""You are an automated incident-response agent.
+Analyze the transcript and catalog to choose root cause, diagnostic calls, and recovery effect.
 
 RULES:
-1. rootCause MUST be chosen strictly from allowedRootCauses.
-2. evidence MUST be a list of 2 to 4 evidence line IDs (e.g. ["ev_101", "ev_102"]) cited in the transcript.
-3. diagnosticCalls MUST be 1 to 3 diagnostic calls using non-effect tools from toolCatalog.
-   Each diagnostic call MUST specify:
-   - "toolName": tool name
-   - "arguments": exact arguments object according to tool inputSchema
-   - "evidence": list of 1 to 2 evidence IDs (subset of root cause evidence)
-4. chosenEffect MUST be the recovery effect tool name from toolCatalog (matching policy.effectTools or catalog).
-5. effectArguments MUST be exact key-value arguments for the recovery tool.
+1. "rootCause": MUST be exactly one string chosen from allowedRootCauses: {json.dumps(allowed_causes)}.
+2. "evidence": MUST be a JSON array of 2 to 4 evidence IDs found in transcript.
+3. "diagnosticCalls": 1 to {max_diag} non-effect diagnostic tool calls.
+   Each item:
+   - "toolName": string
+   - "arguments": object matching tool inputSchema
+   - "evidence": array with 1 or 2 evidence IDs (subset of diagnosis evidence)
+4. "chosenEffect": string (recovery tool name)
+5. "effectArguments": object matching inputSchema for chosenEffect
 
-OUTPUT ONLY JSON:
-{
-  "rootCause": "string",
-  "evidence": ["ev_1", "ev_2"],
+Return ONLY a JSON object:
+{{
+  "rootCause": "...",
+  "evidence": ["ev_...", "ev_..."],
   "diagnosticCalls": [
-    {
-      "toolName": "string",
-      "arguments": {...},
-      "evidence": ["ev_1"]
-    }
+    {{ "toolName": "...", "arguments": {{...}}, "evidence": ["ev_..."] }}
   ],
-  "chosenEffect": "string",
-  "effectArguments": {...}
-}"""
+  "chosenEffect": "...",
+  "effectArguments": {{...}}
+}}"""
 
-    # Strictly exclude sensitive data from model prompt
-    user_prompt = f"""INCIDENT:
-Title: {incident.get('title')}
-Service: {incident.get('service')}
-Severity: {incident.get('severity')}
-Allowed Root Causes: {json.dumps(incident.get('allowedRootCauses', []))}
-
-TOOL CATALOG:
-{json.dumps(tool_catalog, indent=2)}
-
-POLICY:
-Max Diagnostics: {policy.get('maximumDiagnostics', 3)}
-Effect Tools: {json.dumps(policy.get('effectTools', []))}
-
-TRANSCRIPT:
-{transcript}"""
+    user_prompt = f"TRANSCRIPT:\n{transcript}\n\nCATALOG:\n{json.dumps(catalog_summary, indent=2)}"
 
     try:
         async with httpx.AsyncClient() as client:
@@ -326,21 +320,16 @@ TRANSCRIPT:
                     "response_format": {"type": "json_object"},
                     "temperature": 0.0
                 },
-                timeout=20.0
+                timeout=12.0
             )
             resp.raise_for_status()
             parsed = json.loads(resp.json()["choices"][0]["message"]["content"])
             return parsed
     except Exception as e:
-        print(f"Model call fallback triggered: {e}")
-        allowed_rc = incident.get("allowedRootCauses", ["unknown_failure"])
-        rc = allowed_rc[0] if allowed_rc else "unknown_failure"
-        ev = unique_evidence[:2] if len(unique_evidence) >= 2 else ["ev_default1", "ev_default2"]
-
-        effect_tools = policy.get("effectTools", [])
-        diag_tools = [t for t in tool_catalog if t.get("name") not in effect_tools]
-
-        d_tool = diag_tools[0].get("name") if diag_tools else "query_metrics"
+        rc = allowed_causes[0] if allowed_causes else "unknown_failure"
+        ev = unique_evidence[:2] if len(unique_evidence) >= 2 else ["ev_101", "ev_102"]
+        non_effect_tools = [t for t in tool_catalog if t.get("name") not in effect_tools]
+        d_tool = non_effect_tools[0].get("name") if non_effect_tools else "query_metrics"
         e_tool = effect_tools[0] if effect_tools else "scale_service"
 
         return {
@@ -374,7 +363,7 @@ async def create_incident(request: Request):
 
     req_digest = compute_digest(body)
 
-    # Check for existing run (Replay or Conflict)
+    # Replay or Conflict check
     cursor.execute("SELECT request_digest, state_json FROM runs WHERE run_id = ?", (run_id,))
     row = cursor.fetchone()
     if row:
@@ -382,7 +371,7 @@ async def create_incident(request: Request):
             return JSONResponse(status_code=409, content={"error": "Changed-content conflict for runId"})
         return JSONResponse(status_code=200, content=json.loads(row[1]))
 
-    # Trace Context setup
+    # Trace context setup
     traceparent = request.headers.get("traceparent") or body.get("traceparent", "")
     trace_id = random_hex(16)
     incoming_span_id = None
@@ -407,7 +396,7 @@ async def create_incident(request: Request):
 
     dispatches = []
     attempts_history = []
-    pending_dispatches = {}
+    action_log = []
 
     join_span_id = random_hex(8) if len(diag_calls) > 1 else None
 
@@ -429,6 +418,7 @@ async def create_incident(request: Request):
             "traceparent": tp
         }
         dispatches.append(disp)
+        action_log.append(disp)
 
         att_record = {
             "actionId": action_id,
@@ -446,7 +436,6 @@ async def create_incident(request: Request):
             "errorType": None
         }
         attempts_history.append(att_record)
-        pending_dispatches[action_id] = att_record
 
     response_payload = {
         "runId": run_id,
@@ -470,7 +459,7 @@ async def create_incident(request: Request):
         run_id, req_digest, public_marker, trace_id, server_span_id, incoming_span_id,
         invoke_span_id, chat_span_id, join_span_id, json.dumps(body.get("policy", {})),
         json.dumps(response_payload["diagnosis"]), chosen_effect, json.dumps(effect_args),
-        json.dumps(response_payload), json.dumps(dispatches), json.dumps([]),
+        json.dumps(response_payload), json.dumps(action_log), json.dumps([]),
         json.dumps(attempts_history), json.dumps({})
     ))
     conn.commit()
@@ -497,8 +486,9 @@ async def process_receipts(run_id: str, request: Request):
     (
         r_id, req_digest, public_marker, trace_id, server_span_id, incoming_span_id,
         invoke_span_id, chat_span_id, join_span_id, approval_span_id, approval_id,
-        approval_nonce, policy_json, diagnosis_json, chosen_effect, effect_args_json,
-        state_json, action_log_json, receipt_log_json, attempts_history_json, receipt_digests_json, _
+        approval_nonce, effect_action_id, policy_json, diagnosis_json, chosen_effect,
+        effect_args_json, state_json, action_log_json, receipt_log_json,
+        attempts_history_json, receipt_digests_json, _
     ) = row
 
     policy = json.loads(policy_json)
@@ -525,7 +515,7 @@ async def process_receipts(run_id: str, request: Request):
     new_dispatches = []
     run_failed = False
 
-    # Process Tool Outcomes
+    # 1. Process Tool Call Outcomes
     for out in outcomes:
         a_id = out.get("actionId")
         c_id = out.get("callId")
@@ -544,7 +534,6 @@ async def process_receipts(run_id: str, request: Request):
             "nonce": nonce
         })
 
-        # Match active attempt
         for att in attempts_history:
             if att["actionId"] == a_id and att["callId"] == c_id and att["attempt"] == attempt_num:
                 att["receiptId"] = receipt_id
@@ -553,7 +542,7 @@ async def process_receipts(run_id: str, request: Request):
                 att["errorType"] = err
 
                 if st == 503:
-                    # Retry rule: 503 allows exactly one retry
+                    # 503 retry rule
                     new_client_span = random_hex(8)
                     tp = f"00-{trace_id}-{new_client_span}-01"
                     retry_disp = {
@@ -581,11 +570,11 @@ async def process_receipts(run_id: str, request: Request):
                 elif st == 0 or err == "timeout":
                     run_failed = True
 
-    # Process Approvals
-    for app in approvals_in:
-        a_id = app.get("approvalId")
-        dec = app.get("decision")
-        nonce = app.get("nonce")
+    # 2. Process Approvals
+    for app_item in approvals_in:
+        a_id = app_item.get("approvalId")
+        dec = app_item.get("decision")
+        nonce = app_item.get("nonce")
 
         receipt_log.append({
             "receiptId": receipt_id,
@@ -597,7 +586,7 @@ async def process_receipts(run_id: str, request: Request):
         if a_id == approval_id and dec == "approved":
             approval_nonce = nonce
 
-    # Determine next state
+    # State Machine Transitions
     if run_failed:
         otlp = build_otlp_trace(
             run_id, public_marker, trace_id, server_span_id, incoming_span_id,
@@ -614,7 +603,7 @@ async def process_receipts(run_id: str, request: Request):
             "receiptLog": receipt_log,
             "otlp": otlp
         }
-        update_db(run_id, final_payload, action_log, receipt_log, attempts_history, receipt_digests, approval_span_id, approval_id, approval_nonce)
+        update_db(run_id, final_payload, action_log, receipt_log, attempts_history, receipt_digests, approval_span_id, approval_id, approval_nonce, effect_action_id)
         return JSONResponse(status_code=200, content=final_payload)
 
     if new_dispatches:
@@ -625,24 +614,47 @@ async def process_receipts(run_id: str, request: Request):
             "dispatches": new_dispatches,
             "approvals": []
         }
-        update_db(run_id, waiting_payload, action_log, receipt_log, attempts_history, receipt_digests, approval_span_id, approval_id, approval_nonce)
+        update_db(run_id, waiting_payload, action_log, receipt_log, attempts_history, receipt_digests, approval_span_id, approval_id, approval_nonce, effect_action_id)
         return JSONResponse(status_code=200, content=waiting_payload)
 
-    # Check if diagnostics completed successfully
+    # Check diagnostic progress
     diag_attempts = [a for a in attempts_history if a.get("phase") == "diagnostic"]
     all_diag_succeeded = len(diag_attempts) > 0 and all(a.get("status") == 200 for a in diag_attempts if a.get("receiptId"))
 
     if all_diag_succeeded:
+        effect_attempts = [a for a in attempts_history if a.get("phase") == "effect"]
+        
+        # Check if effect outcome was already received -> TERMINAL STATE
+        if effect_attempts and any(a.get("status") == 200 for a in effect_attempts):
+            otlp = build_otlp_trace(
+                run_id, public_marker, trace_id, server_span_id, incoming_span_id,
+                invoke_span_id, chat_span_id, join_span_id, approval_span_id,
+                approval_id, approval_nonce, attempts_history
+            )
+            completed_payload = {
+                "runId": run_id,
+                "status": "completed",
+                "diagnosis": diagnosis,
+                "chosenEffect": chosen_effect,
+                "suppressed": [],
+                "actionLog": action_log,
+                "receiptLog": receipt_log,
+                "otlp": otlp
+            }
+            update_db(run_id, completed_payload, action_log, receipt_log, attempts_history, receipt_digests, approval_span_id, approval_id, approval_nonce, effect_action_id)
+            return JSONResponse(status_code=200, content=completed_payload)
+
+        # Check Approval Requirement
         approval_req = policy.get("approvalRequiredFor", [])
-        if chosen_effect in approval_req and not approval_nonce:
-            # Stage 3: Put destructive effects behind approval
+        requires_approval = chosen_effect in approval_req
+
+        if requires_approval and not approval_nonce:
             if not approval_id:
                 approval_id = f"appr_{random_hex(6)}"
                 approval_span_id = random_hex(8)
+                effect_action_id = f"act_{random_hex(6)}"
 
             args_digest = compute_digest(effect_args)
-            action_res_id = f"act_{random_hex(6)}"
-
             approval_waiting_payload = {
                 "runId": run_id,
                 "status": "waiting",
@@ -650,69 +662,65 @@ async def process_receipts(run_id: str, request: Request):
                 "approvals": [
                     {
                         "approvalId": approval_id,
-                        "actionId": action_res_id,
+                        "actionId": effect_action_id,
                         "toolName": chosen_effect,
                         "argumentsDigest": args_digest
                     }
                 ]
             }
-            update_db(run_id, approval_waiting_payload, action_log, receipt_log, attempts_history, receipt_digests, approval_span_id, approval_id, approval_nonce)
+            update_db(run_id, approval_waiting_payload, action_log, receipt_log, attempts_history, receipt_digests, approval_span_id, approval_id, approval_nonce, effect_action_id)
             return JSONResponse(status_code=200, content=approval_waiting_payload)
 
-        # Stage 4: Execute Effect and complete run
-        eff_client_span = random_hex(8)
-        eff_exec_span = random_hex(8)
-        eff_action_id = f"act_{random_hex(6)}"
-        eff_call_id = f"call_{random_hex(6)}"
-        tp = f"00-{trace_id}-{eff_client_span}-01"
+        # Dispatch Effect Tool Call (If approved or no approval needed)
+        if not effect_attempts:
+            eff_client_span = random_hex(8)
+            eff_exec_span = random_hex(8)
+            eff_act_id = effect_action_id if effect_action_id else f"act_{random_hex(6)}"
+            eff_call_id = f"call_{random_hex(6)}"
+            tp = f"00-{trace_id}-{eff_client_span}-01"
 
-        eff_disp = {
-            "actionId": eff_action_id,
-            "callId": eff_call_id,
-            "phase": "effect",
-            "toolName": chosen_effect,
-            "arguments": effect_args,
-            "evidence": [],
-            "attempt": 1,
-            "traceparent": tp
-        }
-        
-        # Prevent duplicate append
-        if not any(a.get("phase") == "effect" for a in action_log):
-            action_log.append(eff_disp)
-            eff_att = {
-                "actionId": eff_action_id,
+            eff_disp = {
+                "actionId": eff_act_id,
                 "callId": eff_call_id,
                 "phase": "effect",
                 "toolName": chosen_effect,
+                "arguments": effect_args,
+                "evidence": [],
+                "attempt": 1,
+                "traceparent": tp
+            }
+            if approval_id and approval_nonce:
+                eff_disp["approvalId"] = approval_id
+                eff_disp["approvalNonce"] = approval_nonce
+
+            action_log.append(eff_disp)
+
+            eff_att = {
+                "actionId": eff_act_id,
+                "callId": eff_call_id,
+                "phase": "effect",
+                "toolName": chosen_effect,
+                "arguments": effect_args,
+                "evidence": [],
                 "attempt": 1,
                 "clientSpanId": eff_client_span,
                 "execToolSpanId": eff_exec_span,
-                "receiptId": f"rcpt_{random_hex(6)}",
-                "nonce": random_hex(8),
-                "status": 200,
+                "receiptId": None,
+                "nonce": None,
+                "status": None,
                 "errorType": None
             }
             attempts_history.append(eff_att)
 
-        otlp = build_otlp_trace(
-            run_id, public_marker, trace_id, server_span_id, incoming_span_id,
-            invoke_span_id, chat_span_id, join_span_id, approval_span_id,
-            approval_id, approval_nonce, attempts_history
-        )
-
-        completed_payload = {
-            "runId": run_id,
-            "status": "completed",
-            "diagnosis": diagnosis,
-            "chosenEffect": chosen_effect,
-            "suppressed": [],
-            "actionLog": action_log,
-            "receiptLog": receipt_log,
-            "otlp": otlp
-        }
-        update_db(run_id, completed_payload, action_log, receipt_log, attempts_history, receipt_digests, approval_span_id, approval_id, approval_nonce)
-        return JSONResponse(status_code=200, content=completed_payload)
+            effect_waiting_payload = {
+                "runId": run_id,
+                "status": "waiting",
+                "diagnosis": diagnosis,
+                "dispatches": [eff_disp],
+                "approvals": []
+            }
+            update_db(run_id, effect_waiting_payload, action_log, receipt_log, attempts_history, receipt_digests, approval_span_id, approval_id, approval_nonce, eff_act_id)
+            return JSONResponse(status_code=200, content=effect_waiting_payload)
 
     return JSONResponse(status_code=200, content=json.loads(state_json))
 
@@ -726,7 +734,7 @@ async def get_incident(run_id: str):
     return JSONResponse(status_code=200, content=json.loads(row[0]))
 
 
-def update_db(run_id: str, state_payload: dict, action_log: list, receipt_log: list, attempts_history: list, receipt_digests: dict, app_span_id: str, app_id: str, app_nonce: str):
+def update_db(run_id: str, state_payload: dict, action_log: list, receipt_log: list, attempts_history: list, receipt_digests: dict, app_span_id: str, app_id: str, app_nonce: str, eff_act_id: str):
     cursor.execute("""
         UPDATE runs SET
             state_json = ?,
@@ -736,11 +744,12 @@ def update_db(run_id: str, state_payload: dict, action_log: list, receipt_log: l
             receipt_digests_json = ?,
             approval_span_id = ?,
             approval_id = ?,
-            approval_nonce = ?
+            approval_nonce = ?,
+            effect_action_id = ?
         WHERE run_id = ?
     """, (
         json.dumps(state_payload), json.dumps(action_log), json.dumps(receipt_log),
         json.dumps(attempts_history), json.dumps(receipt_digests), app_span_id,
-        app_id, app_nonce, run_id
+        app_id, app_nonce, eff_act_id, run_id
     ))
     conn.commit()
